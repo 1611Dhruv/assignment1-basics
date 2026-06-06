@@ -48,3 +48,10 @@ line-length = 120
 [tool.ruff.lint]
 extend-select = ["UP"]
 ignore = ["F722"]
+
+[tool.pylint.main]
+init-hook = """
+import os, sys
+venv_path = os.path.join(os.getcwd(), '.venv', 'lib', 'python3.13', 'site-packages')
+if os.path.exists(venv_path): sys.path.insert(0, venv_path)
+"""
