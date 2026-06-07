@@ -1,6 +1,7 @@
 import math
 import os
 import statistics as st
+import time
 from collections import Counter, defaultdict
 from concurrent.futures import ProcessPoolExecutor
 from typing import BinaryIO
@@ -96,7 +97,6 @@ def find_chunk_boundaries(
     return sorted(set(chunk_boundaries))
 
 
-RECORD_PERF = True
 PRETOKEN_PAT = regex.compile(
     r"""'(?:[sdmt]|ll|ve|re)| ?\p{L}+| ?\p{N}+| """
     r""""?[^\s\p{L}\p{N}]+|\s+(?!\S)|\s+"""
@@ -104,7 +104,6 @@ PRETOKEN_PAT = regex.compile(
 SPECIAL_TOKEN = "<|endoftext|>"
 
 
-@perf(walltime=True, memory=True, enabled=RECORD_PERF)
 def count_pretokens_for_chunk(file: str, start: int, end: int):
     """
     Helper method which will count the pretokens
@@ -118,7 +117,7 @@ def count_pretokens_for_chunk(file: str, start: int, end: int):
     with open(file, "rb") as f:
         f.seek(start)
 
-        # Read in single chunks?
+        # Read in single minichunks?
         chunk_b = f.read(end - start)
         chunks = chunk_b.decode(encoding="utf-8").split(SPECIAL_TOKEN)
         for chunk in chunks:
@@ -127,16 +126,58 @@ def count_pretokens_for_chunk(file: str, start: int, end: int):
     return counts
 
 
+def count_pretokens_for_chunk_stream(file: str, start: int, end: int):
+    """
+    Helper method which will count the pretokens
+    for a given chunk in a streaming fashion
+
+    Arg:
+        start: the start of a chunk
+        end: the end of a chunk
+    """
+
+    counts = Counter()
+    PAGE_SZ = 4096
+    SPECIAL_TOKEN_B = SPECIAL_TOKEN.encode(encoding="utf-8")
+
+    remaining = end - start
+    buf = b""
+    with open(file, "rb") as f:
+        f.seek(start)
+        while remaining > 0:
+            page = f.read(min(remaining, PAGE_SZ))
+            if not page:
+                break
+
+            remaining -= len(page)
+            buf += page
+
+            while (idx := buf.find(SPECIAL_TOKEN_B)) != -1:
+                doc = buf[:idx].decode(encoding="utf-8")
+                for m in regex.finditer(PRETOKEN_PAT, doc):
+                    counts[m.group()] += 1
+                buf = buf[idx + len(SPECIAL_TOKEN_B) :]
+    if buf:
+        doc = buf.decode(encoding="utf-8")
+        for m in regex.finditer(PRETOKEN_PAT, doc):
+            counts[m.group()] += 1
+
+    return counts
+
+
 def train(
     tokenizer: BPETokenizer,
     file: str,
     numprocs: int = 4,
-    num_chunks: int = 4,
+    num_chunks: int = -1,
 ):
     """
     Training loop to train tokenizer, contains the entire split + tokenize +
     ... flow
     """
+    if num_chunks <= 0:
+        num_chunks = numprocs
+
     with open(file, "rb") as f:
         boundaries = find_chunk_boundaries(
             f, num_chunks, SPECIAL_TOKEN.encode(encoding="utf-8")
@@ -146,40 +187,12 @@ def train(
     with ProcessPoolExecutor(max_workers=numprocs) as pool:
         futures = []
         for start, end in zip(boundaries[:-1], boundaries[1:]):
-            futures.append(pool.submit(count_pretokens_for_chunk, file, start, end))
+            futures.append(
+                pool.submit(count_pretokens_for_chunk_stream, file, start, end)
+            )
 
     total_count = Counter()
-    if RECORD_PERF:
-        metric_agg = defaultdict(list)
     for future in futures:
-        if RECORD_PERF:
-            perf_metric, chunk_counter = future.result()
-        else:
-            chunk_counter = future.result()
-
+        chunk_counter = future.result()
         for token in chunk_counter:
             total_count[token] += chunk_counter[token]
-
-        if RECORD_PERF:
-            for metric, value in perf_metric.items():
-                metric_agg[metric].append(value)
-
-    if RECORD_PERF:
-        final_perf = {
-            k: {
-                "mean": st.mean(vals),
-                "median": st.median(vals),
-                "stdev": st.stdev(vals) if len(vals) > 1 else 0.0,
-                "min": min(vals),
-                "max": max(vals),
-                "n": len(vals),
-            }
-            for k, vals in metric_agg.items()
-        }
-
-        for metric, stats in final_perf.items():
-            print(f"{metric}: ")
-            for stat_name, stat_val in stats.items():
-                print(f"    {stat_name}: {stat_val:.4f}")
-
-    # tokenizer.use_pretoken_counts(total_count)

@@ -37,7 +37,7 @@ def perf(walltime=False, memory=False, enabled=False):
 
             if walltime:
                 duration = t.perf_counter_ns() - start
-                metrics["walltime_ms"] = duration / 1e6
+                metrics["walltime_s"] = duration / 1e9
 
             if memory:
                 current, peak = tracemalloc.get_traced_memory()
