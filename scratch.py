@@ -1,11 +1,8 @@
 import pickle
 from collections import Counter
 from functools import partial
-from random import randint, shuffle
-from timeit import timeit
 
 import numpy as np
-import regex as re
 
 from cs336_basics.pretokenize import (
     SPECIAL_EOT_TOKEN,
