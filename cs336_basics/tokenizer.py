@@ -1,17 +1,33 @@
-import math
-import os
-import statistics as st
-import time
-from collections import Counter, defaultdict
-from concurrent.futures import ProcessPoolExecutor
-from typing import BinaryIO
+import pickle
+from abc import ABC, abstractclassmethod, abstractmethod
+from functools import reduce
+from typing import Iterable, Iterator
 
 import regex
 
-from .perf import perf
+PRETOKEN_REG = (
+    r"""'(?:[sdmt]|ll|ve|re)| ?\p{L}+| ?\p{N}+| ?[^\s\p{L}\p{N}]+|\s+(?!\S)|\s+"""
+)
+PRETOKEN_PAT = regex.compile(PRETOKEN_REG)
 
 
-class BPETokenizer:
+class Tokenizer(ABC):
+    @abstractclassmethod
+    def from_files(
+        cls,
+        vocab_filepath: str,
+        merges_filepath: str,
+        special_tokens: list[str] | None = None,
+    ): ...
+    @abstractmethod
+    def encode(self, text: str) -> list[int]: ...
+    @abstractmethod
+    def encode_iterable(self, iterable: Iterable[str]) -> Iterator[int]: ...
+    @abstractmethod
+    def decode(self, ids: list[int]) -> str: ...
+
+
+class BPETokenizer(Tokenizer):
     """
     The actual BPETokenizer implementation,
     what we will end up doing is uhm... some kind of
@@ -19,180 +35,124 @@ class BPETokenizer:
     accept merges?
     """
 
-    def __init__(self, vocab_size: int):
+    def __init__(
+        self,
+        vocab: dict[int, bytes],
+        merges: list[tuple[bytes, bytes]],
+        special_tokens: list[str] | None = None,
+    ):
         """
-        Construuctor for BPETokenizer,
-        vocab_size is the # of tokens you want at the end
-        numthreads is the for parallelism
-
+        Construct a BPE tokenizer out of vocabulary merges and optional
+        special_tokens list
         """
-        self.vocab_size = vocab_size
-        self.merges: list[tuple[bytes, bytes]] = []
+        self.vocab = vocab
+        self.to_token_id = {vocab[token_id]: token_id for token_id in vocab}
+        self.to_merge = {pair: order for order, pair in enumerate(merges)}
+        self.special_pattern = "(?!)"
+        self.MAX_SPECIAL = 1
 
-        # Initialize vocab to be {i, byte(i)}
-        self.vocab: dict[int, bytes] = {i: bytes([i]) for i in range(256)}
-
-        # Initialize the pretoken counters
-        self.bytecounter: Counter[bytes] = Counter()
-
-    def use_pretoken_counts(self, counter: Counter[str]):
-        """
-        Will finalize the pretoken counts and get you the final byte counts
-        """
-        for pretoken in counter:
-            bs = pretoken.encode("utf-8")
-            for b in bs:
-                self.bytecounter[b] += counter[pretoken]
-
-    def _merge(self, byte1: bytes, byte2: bytes):
-        pass
-
-
-def find_chunk_boundaries(
-    file: BinaryIO,
-    desired_num_chunks: int,
-    split_special_token: bytes,
-) -> list[int]:
-    """
-    Chunk the file into parts that can be counted independently.
-    May return fewer chunks if the boundaries end up overlapping.
-    """
-    assert isinstance(
-        split_special_token, bytes
-    ), "Must represent special token as a bytestring"
-
-    # Get total file size in bytes
-    file.seek(0, os.SEEK_END)
-    file_size = file.tell()
-    file.seek(0)
-
-    chunk_size = file_size // desired_num_chunks
-
-    # Initial guesses for chunk boundary locations, uniformly spaced
-    # Chunks start on previous index, don't include last index
-    chunk_boundaries = [i * chunk_size for i in range(desired_num_chunks + 1)]
-    chunk_boundaries[-1] = file_size
-
-    mini_chunk_size = 4096  # Read ahead by 4k bytes at a time
-
-    for bi in range(1, len(chunk_boundaries) - 1):
-        initial_position = chunk_boundaries[bi]
-        file.seek(initial_position)  # Start at boundary guess
-        while True:
-            mini_chunk = file.read(mini_chunk_size)  # Read a mini chunk
-
-            # If EOF, this boundary should be at the end of the file
-            if mini_chunk == b"":
-                chunk_boundaries[bi] = file_size
-                break
-
-            # Find the special token in the mini chunk
-            found_at = mini_chunk.find(split_special_token)
-            if found_at != -1:
-                chunk_boundaries[bi] = initial_position + found_at
-                break
-            initial_position += mini_chunk_size
-
-    # Make sure all boundaries are unique, but might be fewer than desired_num_chunks
-    return sorted(set(chunk_boundaries))
-
-
-PRETOKEN_PAT = regex.compile(
-    r"""'(?:[sdmt]|ll|ve|re)| ?\p{L}+| ?\p{N}+| """
-    r""""?[^\s\p{L}\p{N}]+|\s+(?!\S)|\s+"""
-)
-SPECIAL_TOKEN = "<|endoftext|>"
-
-
-def count_pretokens_for_chunk(file: str, start: int, end: int):
-    """
-    Helper method which will count the pretokens
-    for a given chunk
-
-    Arg:
-        start: the start of a chunk
-        end: the end of a chunk
-    """
-    counts = Counter()
-    with open(file, "rb") as f:
-        f.seek(start)
-
-        # Read in single minichunks?
-        chunk_b = f.read(end - start)
-        chunks = chunk_b.decode(encoding="utf-8").split(SPECIAL_TOKEN)
-        for chunk in chunks:
-            for pretoken in regex.finditer(PRETOKEN_PAT, chunk):
-                counts[pretoken.group()] += 1
-    return counts
-
-
-def count_pretokens_for_chunk_stream(file: str, start: int, end: int):
-    """
-    Helper method which will count the pretokens
-    for a given chunk in a streaming fashion
-
-    Arg:
-        start: the start of a chunk
-        end: the end of a chunk
-    """
-
-    counts = Counter()
-    PAGE_SZ = 4096
-    SPECIAL_TOKEN_B = SPECIAL_TOKEN.encode(encoding="utf-8")
-
-    remaining = end - start
-    buf = b""
-    with open(file, "rb") as f:
-        f.seek(start)
-        while remaining > 0:
-            page = f.read(min(remaining, PAGE_SZ))
-            if not page:
-                break
-
-            remaining -= len(page)
-            buf += page
-
-            while (idx := buf.find(SPECIAL_TOKEN_B)) != -1:
-                doc = buf[:idx].decode(encoding="utf-8")
-                for m in regex.finditer(PRETOKEN_PAT, doc):
-                    counts[m.group()] += 1
-                buf = buf[idx + len(SPECIAL_TOKEN_B) :]
-    if buf:
-        doc = buf.decode(encoding="utf-8")
-        for m in regex.finditer(PRETOKEN_PAT, doc):
-            counts[m.group()] += 1
-
-    return counts
-
-
-def train(
-    tokenizer: BPETokenizer,
-    file: str,
-    numprocs: int = 4,
-    num_chunks: int = -1,
-):
-    """
-    Training loop to train tokenizer, contains the entire split + tokenize +
-    ... flow
-    """
-    if num_chunks <= 0:
-        num_chunks = numprocs
-
-    with open(file, "rb") as f:
-        boundaries = find_chunk_boundaries(
-            f, num_chunks, SPECIAL_TOKEN.encode(encoding="utf-8")
-        )
-
-    # Start handing of each chunk to a thread
-    with ProcessPoolExecutor(max_workers=numprocs) as pool:
-        futures = []
-        for start, end in zip(boundaries[:-1], boundaries[1:]):
-            futures.append(
-                pool.submit(count_pretokens_for_chunk_stream, file, start, end)
+        if special_tokens:
+            self.MAX_SPECIAL = len(max(special_tokens, key=len))
+            self.special_pattern = "|".join(
+                regex.escape(t)
+                for t in sorted(
+                    special_tokens,
+                    key=len,
+                    reverse=True,
+                )
             )
 
-    total_count = Counter()
-    for future in futures:
-        chunk_counter = future.result()
-        for token in chunk_counter:
-            total_count[token] += chunk_counter[token]
+    @classmethod
+    def from_files(
+        cls,
+        vocab_filepath: str,
+        merges_filepath: str,
+        special_tokens: list[str] | None = None,
+    ):
+        with open(vocab_filepath, "rb") as vocab_file:
+            vocab = pickle.load(vocab_file)
+
+        with open(merges_filepath, "rb") as merges_file:
+            merges = pickle.load(merges_file)
+
+        return BPETokenizer(vocab, merges, special_tokens)
+
+    def _encode_pretoken(self, pretoken: str) -> Iterator[int]:
+        pretoken_b = pretoken.encode(encoding="utf-8")
+        pretoken_bl = [bytes([ch]) for ch in pretoken_b]
+        while len(pretoken_bl) > 1:
+            best = min(
+                (
+                    (self.to_merge.get(pair, float("inf")), i)
+                    for i, pair in enumerate(zip(pretoken_bl, pretoken_bl[1:]))
+                ),
+            )
+            rank, i = best
+            if rank == float("inf"):
+                break
+            pretoken_bl = (
+                pretoken_bl[:i]
+                + [pretoken_bl[i] + pretoken_bl[i + 1]]
+                + pretoken_bl[i + 2 :]
+            )
+
+        for b in pretoken_bl:
+            yield self.to_token_id[b]
+
+    def encode(self, text: str) -> list[int]:
+        """
+        Encodes a piece of text / chunk into a list of tokens
+        """
+        chunk_size = 4096 // 4
+        chunks = (text[i : i + chunk_size] for i in range(0, len(text), chunk_size))
+        return list(self.encode_iterable(chunks))
+
+    def encode_iterable(self, iterable: Iterable[str]) -> Iterator[int]:
+        """
+        Encodes in an iterable fashion
+        """
+        buf = ""
+        special_pat = regex.compile(self.special_pattern)
+        for chunk in iterable:
+            buf += chunk
+
+            last = 0
+            for m in special_pat.finditer(buf):
+                if m.end() == len(buf):
+                    break
+                yield from self._pretokenize(buf[last : m.start()], final=True)
+                yield self.to_token_id[m.group().encode("utf-8")]
+                last = m.end()
+            buf = buf[last:]
+
+            safe_end = len(buf) - (self.MAX_SPECIAL - 1)
+            if safe_end > 0:
+                safe, buf = buf[:safe_end], buf[safe_end:]
+                tail = yield from self._pretokenize(safe, final=False)
+                buf = tail + buf
+        last = 0
+        for m in special_pat.finditer(buf):
+            yield from self._pretokenize(buf[last : m.start()], final=True)
+            yield self.to_token_id[m.group().encode("utf-8")]
+            last = m.end()
+        yield from self._pretokenize(buf[last:], final=True)
+
+    def _pretokenize(self, text, final):
+        last = 0
+        for m in PRETOKEN_PAT.finditer(text):
+            if not final and m.end() == len(text):
+                return text[m.start() :]
+            yield from self._encode_pretoken(m.group())
+            last = m.end()
+        if final:
+            return ""
+        return text[last:]
+
+    def decode(self, ids: list[int]) -> str:
+        """
+        Decodes form a list of tokens using the vocabulary
+        """
+        return b"".join([self.vocab[i] for i in ids]).decode(
+            encoding="utf-8",
+            errors="replace",
+        )

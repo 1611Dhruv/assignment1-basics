@@ -20,6 +20,7 @@ dependencies = [
     "ty>=0.0.26",
     "ruff>=0.15.8",
     "py-spy>=0.4.2",
+    "matplotlib>=3.11.0",
 ]
 
 [build-system]
@@ -56,3 +57,8 @@ import os, sys
 venv_path = os.path.join(os.getcwd(), '.venv', 'lib', 'python3.13', 'site-packages')
 if os.path.exists(venv_path): sys.path.insert(0, venv_path)
 """
+
+[dependency-groups]
+dev = [
+    "py-spy>=0.4.2",
+]

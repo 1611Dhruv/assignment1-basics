@@ -1,13 +1,24 @@
 from __future__ import annotations
 
 import os
+from collections import Counter
 from collections.abc import Iterable
+from functools import partial
 from typing import IO, Any, BinaryIO
 
 import numpy.typing as npt
 import torch
 from jaxtyping import Bool, Float, Int
 from torch import Tensor
+
+from cs336_basics.pretokenize import (
+    SPECIAL_TOKEN,
+    count_pretokens_mapper,
+    count_pretokens_reducer,
+    multiproc_pretokens,
+)
+from cs336_basics.tokenizer import BPETokenizer
+from cs336_basics.train.tokenizer import train_tokenizer
 
 
 def run_linear(
@@ -452,7 +463,9 @@ def run_cross_entropy(
     raise NotImplementedError
 
 
-def run_gradient_clipping(parameters: Iterable[torch.nn.Parameter], max_l2_norm: float) -> None:
+def run_gradient_clipping(
+    parameters: Iterable[torch.nn.Parameter], max_l2_norm: float
+) -> None:
     """Given a set of parameters, clip their combined gradients to have l2 norm at most max_l2_norm.
 
     Args:
@@ -559,7 +572,7 @@ def get_tokenizer(
     Returns:
         A BPE tokenizer that uses the provided vocab, merges, and special tokens.
     """
-    raise NotImplementedError
+    return BPETokenizer(vocab, merges, special_tokens)
 
 
 def run_train_bpe(
@@ -589,4 +602,9 @@ def run_train_bpe(
                 representing that <token1> was merged with <token2>.
                 Merges are ordered by order of creation.
     """
-    raise NotImplementedError
+    mapper = partial(count_pretokens_mapper, end_token=SPECIAL_TOKEN)
+    pretoken_counts = multiproc_pretokens(
+        input_path, mapper, count_pretokens_reducer, Counter(), numprocs=12
+    )
+    vocab, merges = train_tokenizer(vocab_size, special_tokens, pretoken_counts)
+    return vocab, merges
