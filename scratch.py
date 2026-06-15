@@ -1,18 +1,13 @@
 import torch
 import torch.nn as nn
 
-from cs336_basics.layers import RMSNorm, SwiGLU
+from cs336_basics.layers import RoPE, Transformer
 
-batch = 5
-seq = 4
-d_model = 2
+"""
+t = Transformer(50_257, 1_600, 48, 25, 4_288)
 
-inp = torch.tensor(
-    [[[i + i * j + i * j * k for k in range(d_model)] for j in range(seq)] for i in range(batch)], dtype=torch.float32
-)
-print(inp)
-rms_norm = RMSNorm(d_model)
-print(rms_norm.forward(inp))
+print(sum(p.numel() for p in t.parameters()))
+print((50257 * 1600) + 48 * (25 * (1600 * 64 * 3) + 1600 * 1600 + 2 * 1600 + 3 * 1600 * 4288) + 1600 + 1600 * 50257)
+"""
 
-swiglu = SwiGLU(d_model, 10)
-print(swiglu.forward(inp))
+FILE = "data/TinyStoriesV2-GPT4-train.txt"

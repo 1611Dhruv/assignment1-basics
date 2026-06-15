@@ -187,7 +187,7 @@ class RoPE(nn.Module):
         return roped
 
 
-def softmax(x: torch.Tensor, dim: int) -> torch.Tensor:
+def softmax(x: torch.Tensor, dim: int = -1) -> torch.Tensor:
     stable = x - torch.max(x, dim=dim, keepdim=True).values
     e = torch.exp(stable)
     return e / e.sum(dim=dim, keepdim=True)
@@ -207,7 +207,7 @@ class MultiHeadSelfAttention(nn.Module):
         num_heads: int,
         dtype: torch.dtype | None = None,
         device: torch.device | None = None,
-        positional_encoding: nn.Module = None,
+        positional_encoding: nn.Module | None = None,
     ):
         super().__init__()
         d_k = d_model // num_heads
@@ -229,7 +229,6 @@ class MultiHeadSelfAttention(nn.Module):
         Qh = einsum(x, self.wq, "... d_model, nh_dk d_model -> ... nh_dk")
         Kh = einsum(x, self.wk, "... d_model, nh_dk d_model -> ... nh_dk")
         Vh = einsum(x, self.wv, "... d_model, nh_dv d_model -> ... nh_dv")
-
         # Apply positional_encoding
         seq_q = Qh.shape[-2]
         seq_k = Qh.shape[-2]
@@ -246,3 +245,56 @@ class MultiHeadSelfAttention(nn.Module):
 
         attend = rearrange(attention_out, "... nh seq d_v -> ... seq (nh d_v)")
         return einsum(attend, self.wo, "... seq nh_dv, ... d_model nh_dv -> ... seq d_model")
+
+
+# Returns one Transformer block
+class TransformerBlock(nn.Module):
+    def __init__(
+        self,
+        d_model: int,
+        num_heads: int,
+        d_ff: int,
+        dtype: torch.dtype | None = None,
+        device: torch.device | None = None,
+        positional_encoding: nn.Module | None = None,
+    ):
+        super().__init__()
+        self.rms1 = RMSNorm(d_model)
+        self.mha = MultiHeadSelfAttention(d_model, num_heads, dtype, device, positional_encoding)
+        self.rms2 = RMSNorm(d_model, device=device, dtype=dtype)
+        self.ff = SwiGLU(d_model, d_ff, dtype, device)
+        pass
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        yMHA = x + self.mha(self.rms1(x))
+        yFF = yMHA + self.ff(self.rms2(yMHA))
+        return yFF
+
+
+class Transformer(nn.Module):
+    def __init__(
+        self,
+        vocab_size: int,
+        d_model: int,
+        num_layers: int,
+        num_heads: int,
+        d_ff: int,
+        dtype: torch.dtype | None = None,
+        device: torch.device | None = None,
+        positional_encoding: nn.Module | None = None,
+    ):
+        super().__init__()
+        self.in_embedd = Embedding(vocab_size, d_model, device, dtype)
+        self.layers = nn.ModuleList(
+            [TransformerBlock(d_model, num_heads, d_ff, dtype, device, positional_encoding) for _ in range(num_layers)]
+        )
+        self.out_norm = RMSNorm(d_model, device=device, dtype=dtype)
+        self.out_embedd = Linear(d_model, vocab_size)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        x = self.in_embedd(x)
+        for layer in self.layers:
+            x = layer(x)
+        x = self.out_norm(x)
+        x = self.out_embedd(x)
+        return x

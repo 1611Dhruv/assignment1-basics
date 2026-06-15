@@ -21,6 +21,10 @@ dependencies = [
     "ruff>=0.15.8",
     "py-spy>=0.4.2",
     "matplotlib>=3.11.0",
+    "ipykernel>=7.3.0",
+    "viztracer>=1.1.1",
+    "ipywidgets>=8.1.8",
+    "snakeviz>=2.2.2",
 ]
 
 [build-system]

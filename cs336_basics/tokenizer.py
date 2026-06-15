@@ -63,6 +63,17 @@ class BPETokenizer(Tokenizer):
             )
 
     @classmethod
+    def from_file(
+        cls,
+        tokenizer_filepath: str,
+        special_tokens: list[str] | None = None,
+    ):
+        with open(tokenizer_filepath, "rb") as vocab_file:
+            vocab, merges = pickle.load(vocab_file)
+
+        return BPETokenizer(vocab, merges, special_tokens)
+
+    @classmethod
     def from_files(
         cls,
         vocab_filepath: str,

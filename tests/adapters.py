@@ -20,6 +20,8 @@ from cs336_basics.layers import (
     RoPE,
     SiLU,
     SwiGLU,
+    Transformer,
+    TransformerBlock,
     scaled_dot_product_attention,
     softmax,
 )
@@ -315,7 +317,25 @@ def run_transformer_block(
         Float[Tensor, "batch sequence_length d_model"] Tensor with the output of
         running the Transformer block on the input features while using RoPE.
     """
-    raise NotImplementedError
+    rope = RoPE(theta, d_model // num_heads, max_seq_len)
+    transform = TransformerBlock(d_model, num_heads, d_ff, positional_encoding=rope)
+    transform.load_state_dict(
+        {
+            # FF
+            "ff.w1": weights["ffn.w1.weight"],
+            "ff.w2": weights["ffn.w2.weight"],
+            "ff.w3": weights["ffn.w3.weight"],
+            # MHA
+            "mha.wq": weights["attn.q_proj.weight"],
+            "mha.wk": weights["attn.k_proj.weight"],
+            "mha.wv": weights["attn.v_proj.weight"],
+            "mha.wo": weights["attn.output_proj.weight"],
+            # RMS
+            "rms1.g": weights["ln1.weight"],
+            "rms2.g": weights["ln2.weight"],
+        }
+    )
+    return transform(in_features)
 
 
 def run_transformer_lm(
@@ -397,7 +417,27 @@ def run_transformer_lm(
         Float[Tensor, "batch_size sequence_length vocab_size"]: Tensor with the predicted unnormalized
         next-word distribution for each token.
     """
-    raise NotImplementedError
+    rope = RoPE(rope_theta, (d_model // num_heads), context_length)
+    transformer = Transformer(vocab_size, d_model, num_layers, num_heads, d_ff, positional_encoding=rope)
+    ws = weights.items()
+
+    def convert(s: str):
+        s = s.replace("token_embeddings.weight", "in_embedd.embedding")
+        s = s.replace("attn.q_proj.weight", "mha.wq")
+        s = s.replace("attn.k_proj.weight", "mha.wk")
+        s = s.replace("attn.v_proj.weight", "mha.wv")
+        s = s.replace("attn.output_proj.weight", "mha.wo")
+        s = s.replace("ln1.weight", "rms1.g")
+        s = s.replace("ln2.weight", "rms2.g")
+        s = s.replace("ffn.w1.weight", "ff.w1")
+        s = s.replace("ffn.w2.weight", "ff.w2")
+        s = s.replace("ffn.w3.weight", "ff.w3")
+        s = s.replace("ln_final.weight", "out_norm.g")
+        s = s.replace("lm_head.weight", "out_embedd.weights")
+        return s
+
+    transformer.load_state_dict({convert(key): val for key, val in ws})
+    return transformer(in_indices)
 
 
 def run_rmsnorm(
