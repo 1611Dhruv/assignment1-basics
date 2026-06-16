@@ -298,3 +298,14 @@ class Transformer(nn.Module):
         x = self.out_norm(x)
         x = self.out_embedd(x)
         return x
+
+
+def cross_entropy(outputs: torch.Tensor, targets: torch.Tensor):
+    """
+    Assuming outputs = [batch_size vocab] and targets [batch_size]
+    """
+    max_logit = outputs.max(dim=-1).values[..., None]
+    outputs = outputs - max_logit
+    predicted = torch.gather(outputs, -1, targets[..., None]).squeeze(-1)
+    soft_sum = torch.log(torch.sum(torch.exp(outputs), dim=-1))
+    return torch.mean(soft_sum - predicted)
