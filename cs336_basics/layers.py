@@ -1,10 +1,16 @@
+import math
+import os
+import typing
+from collections.abc import Callable, Iterable
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from math import cos, sin
 
 import torch
 import torch.nn as nn
 from einops import einsum, rearrange
-from numpy import sqrt
+from numpy import sqrt, stack
+from numpy.random import randint
+from numpy.typing import NDArray
 
 
 def _get_mat(
@@ -309,3 +315,145 @@ def cross_entropy(outputs: torch.Tensor, targets: torch.Tensor):
     predicted = torch.gather(outputs, -1, targets[..., None]).squeeze(-1)
     soft_sum = torch.log(torch.sum(torch.exp(outputs), dim=-1))
     return torch.mean(soft_sum - predicted)
+
+
+class SGD(torch.optim.Optimizer):
+    def __init__(self, params, lr=1e-3):
+        if lr < 0:
+            raise ValueError(f"Invalid learning rate: {lr}")
+        defaults = {"lr": lr}
+        super().__init__(params, defaults)
+
+    def step(self, closure: Callable | None = None):
+        loss = None if closure is None else closure()
+        print(self.param_groups)
+        for group in self.param_groups:
+            lr = group["lr"]
+            for p in group["params"]:
+                if p.grad is None:
+                    continue
+
+                state = self.state[p]
+                t = state.get("t", 0)
+                grad = p.grad.data
+                p.data -= lr / math.sqrt(t + 1) * grad
+                state["t"] = t + 1
+
+        return loss
+
+
+class AdamW(torch.optim.Optimizer):
+    def __init__(self, params, lr=1e-3, weight_decay=1, betas=(0.9, 0.999), eps=1e-8):
+        if lr < 0:
+            raise ValueError(f"Invalid learning rate: {lr}")
+        defaults = {
+            "lr": lr,
+            "betas": betas,
+            "weight_decay": weight_decay,
+        }
+        self.eps = eps
+        super().__init__(params, defaults)
+
+    def step(self, closure: Callable | None = None):
+        loss = None if closure is None else closure()
+
+        for group in self.param_groups:
+            lr = group["lr"]
+            beta1, beta2 = group["betas"]
+            weight_decay = group["weight_decay"]
+            params = group["params"]
+
+            for p in params:
+                if p.grad is None:
+                    continue
+
+                # Get the state
+                state = self.state[p]
+
+                # Get our initial vars
+                t = state.get("t", 1)
+                m = state.get("m", torch.zeros_like(p.data))
+                v = state.get("v", torch.zeros_like(p.data))
+
+                # Get gradient
+                g = p.grad.data
+
+                lr_t = lr * math.sqrt(1 - beta2**t) / (1 - beta1**t)
+                p.data -= lr * weight_decay * p.data
+
+                # Update t,m,v
+                state["t"] = t + 1
+                state["m"] = beta1 * m + (1 - beta1) * g
+                state["v"] = beta2 * v + (1 - beta2) * g * g
+
+                p.data -= lr_t * state["m"] / (torch.sqrt(state["v"]) + self.eps)
+
+        return loss
+
+
+def learning_rate_schedule(t: int, alph_max: float, alph_min: float, T_w: int, T_c: int):
+    if t < T_w:
+        return t / T_w * alph_max
+
+    if t > T_c:
+        return alph_min
+
+    return alph_min + 1 / 2 * (1 + math.cos((t - T_w) / (T_c - T_w) * math.pi)) * (alph_max - alph_min)
+
+
+def gradient_clip(params: Iterable[torch.nn.Parameter], M: float, eps=1e-6):
+    g_2 = 0
+    for param in params:
+        g = param.grad
+        if g is None:
+            continue
+        g_2 += (g * g).sum().item()
+
+    if sqrt(g_2) >= M:
+        for param in params:
+            if param.grad is None:
+                continue
+            param.grad *= M / (sqrt(g_2) + eps)
+
+
+def load_data(data: NDArray, batch_size: int, context_length: int, device: str):
+    K = len(data)
+    batches = []
+    for _ in range(batch_size):
+        s = randint(0, K - context_length)
+        batches.append((data[s : s + context_length], data[s + 1 : s + context_length + 1]))
+    return torch.from_numpy(
+        stack([batch[0] for batch in batches]),
+    ).to(
+        device,
+        dtype=torch.int64,
+    ), torch.from_numpy(
+        stack([batch[1] for batch in batches]),
+    ).to(
+        device,
+        dtype=torch.int64,
+    )
+
+
+def save_checkpoint(
+    model: torch.nn.Module,
+    optimizer: torch.optim.Optimizer,
+    iteration: int,
+    out: str | os.PathLike | typing.BinaryIO | typing.IO[bytes],
+):
+    saved = {}
+    saved["model_state"] = model.state_dict()
+    saved["optimizer_state"] = optimizer.state_dict()
+    saved["iteration"] = iteration
+    torch.save(saved, out)
+
+
+def load_checkpoint(
+    src: str | os.PathLike | typing.BinaryIO | typing.IO[bytes],
+    model: torch.nn.Module,
+    optimizer: torch.optim.Optimizer,
+):
+    saved = torch.load(src)
+    model.load_state_dict(saved["model_state"])
+    optimizer.load_state_dict(saved["optimizer_state"])
+    return saved["iteration"]
