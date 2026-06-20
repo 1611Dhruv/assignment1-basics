@@ -114,9 +114,7 @@ class BPETokenizer(Tokenizer):
         """
         Encodes a piece of text / chunk into a list of tokens
         """
-        chunk_size = 4096 // 4
-        chunks = (text[i : i + chunk_size] for i in range(0, len(text), chunk_size))
-        return list(self.encode_iterable(chunks))
+        return list(self.encode_iterable(text.split('<|endoftext|>')))
 
     def encode_iterable(self, iterable: Iterable[str]) -> Iterator[int]:
         """

@@ -5,25 +5,26 @@ from collections.abc import Callable, Iterable
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from math import cos, sin
 
+import numpy as np
 import torch
 import torch.nn as nn
 from einops import einsum, rearrange
 from numpy import sqrt, stack
 from numpy.random import randint
 from numpy.typing import NDArray
+from tqdm import tqdm
 
 
 def _get_mat(
     d1: int,
     d2: int,
     device: torch.device | None = None,
-    dtype: torch.device | None = None,
+    dtype: torch.dtype | None = None,
 ) -> torch.Tensor:
     sigma = sqrt(2 / (d1 + d2))
     return nn.init.trunc_normal_(
         torch.zeros(
-            d1,
-            d2,
+            (d1, d2),
             device=device,
             dtype=dtype,
         ),
@@ -103,7 +104,7 @@ class RMSNorm(nn.Module):
         dtype: torch.dtype | None = None,
     ):
         super().__init__()
-        self.g = nn.Parameter(torch.ones(d_model))
+        self.g = nn.Parameter(torch.ones(d_model, dtype=dtype, device=device))
         self.d_model = d_model
         self.eps = eps
 
@@ -112,7 +113,7 @@ class RMSNorm(nn.Module):
         x = x.to(torch.float32)
         rms = 1 / torch.sqrt(1 / self.d_model * einsum(x, x, "... dim_model, ... dim_model -> ...") + self.eps)
         norm = einsum(x, rms, self.g, "... dim_model, ..., dim_model -> ... dim_model")
-        x = x.to(x_type)
+        norm = norm.to(x_type)
         return norm
 
 
@@ -121,8 +122,8 @@ class SwiGLU(nn.Module):
         self,
         d_model: int,
         d_ff: int,
-        device: torch.device | None = None,
         dtype: torch.dtype | None = None,
+        device: torch.device | None = None,
     ):
         super().__init__()
         self.w1 = nn.Parameter(_get_mat(d_ff, d_model, device, dtype))
@@ -170,12 +171,18 @@ class RoPE(nn.Module):
         assert d_k % 2 == 0, "Model dim must be even to make pair ropes encodable"
         self.register_buffer(
             "sin_buff",
-            torch.tensor([[[sin(i / theta ** (2 * k / d_k))] for k in range(d_k // 2)] for i in range(max_seq_len)]),
+            torch.tensor(
+                [[[sin(i / theta ** (2 * k / d_k))] for k in range(d_k // 2)] for i in range(max_seq_len)],
+                device=device,
+            ),
             persistent=False,
         )
         self.register_buffer(
             "cos_buff",
-            torch.tensor([[[cos(i / theta ** (2 * k / d_k))] for k in range(d_k // 2)] for i in range(max_seq_len)]),
+            torch.tensor(
+                [[[cos(i / theta ** (2 * k / d_k))] for k in range(d_k // 2)] for i in range(max_seq_len)],
+                device=device,
+            ),
             persistent=False,
         )
 
@@ -184,24 +191,30 @@ class RoPE(nn.Module):
         x: torch.Tensor,
         token_positions: torch.Tensor,
     ) -> torch.Tensor:
-
+        x_type = x.dtype
+        x = x.to(dtype=torch.float32)
         x_p = rearrange(x, "... (pair two) -> ... pair two", two=2)
         q1, q2 = x_p.chunk(2, dim=-1)
         rope_cos = x_p * self.cos_buff[token_positions]
         rope_sin = torch.cat([-q2, q1], dim=-1) * self.sin_buff[token_positions]
         roped = rearrange(rope_sin + rope_cos, "... pair two -> ... (pair two)")
+        roped = roped.to(dtype=x_type)
         return roped
 
 
-def softmax(x: torch.Tensor, dim: int = -1) -> torch.Tensor:
+def softmax(
+    x: torch.Tensor,
+    dim: int = -1,
+    temp: float = 1.0,
+) -> torch.Tensor:
     stable = x - torch.max(x, dim=dim, keepdim=True).values
-    e = torch.exp(stable)
+    e = torch.exp(stable / temp)
     return e / e.sum(dim=dim, keepdim=True)
 
 
 def scaled_dot_product_attention(Q: torch.Tensor, K: torch.Tensor, V: torch.Tensor, mask: torch.Tensor):
     projs = einsum(Q, K, "... seq_q d_k, ... seq_k d_k -> ... seq_q seq_k") / sqrt(Q.shape[-1])
-    masked_projs = projs.masked_fill(mask == False, float("-inf"))
+    masked_projs = projs.masked_fill(~mask, float("-inf"))
     probs = softmax(masked_projs, -1)
     return einsum(probs, V, "... seq_q seq_k, ... seq_k d_v -> ... seq_q d_v")
 
@@ -246,7 +259,7 @@ class MultiHeadSelfAttention(nn.Module):
 
         Vs = rearrange(Vh, "... seq (nh d_v) -> ... nh seq d_v", nh=self.h)
 
-        causal_mask = torch.tensor([[j <= i for j in range(seq_k)] for i in range(seq_q)], device=x.device)
+        causal_mask = torch.tril(torch.ones(seq_q, seq_k, dtype=torch.bool, device=x.device))
         attention_out = scaled_dot_product_attention(Qs, Ks, Vs, causal_mask)
 
         attend = rearrange(attention_out, "... nh seq d_v -> ... seq (nh d_v)")
@@ -265,7 +278,7 @@ class TransformerBlock(nn.Module):
         positional_encoding: nn.Module | None = None,
     ):
         super().__init__()
-        self.rms1 = RMSNorm(d_model)
+        self.rms1 = RMSNorm(d_model, dtype=dtype, device=device)
         self.mha = MultiHeadSelfAttention(d_model, num_heads, dtype, device, positional_encoding)
         self.rms2 = RMSNorm(d_model, device=device, dtype=dtype)
         self.ff = SwiGLU(d_model, d_ff, dtype, device)
@@ -295,7 +308,7 @@ class Transformer(nn.Module):
             [TransformerBlock(d_model, num_heads, d_ff, dtype, device, positional_encoding) for _ in range(num_layers)]
         )
         self.out_norm = RMSNorm(d_model, device=device, dtype=dtype)
-        self.out_embedd = Linear(d_model, vocab_size)
+        self.out_embedd = Linear(d_model, vocab_size, device=device, dtype=dtype)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         x = self.in_embedd(x)
@@ -326,7 +339,6 @@ class SGD(torch.optim.Optimizer):
 
     def step(self, closure: Callable | None = None):
         loss = None if closure is None else closure()
-        print(self.param_groups)
         for group in self.param_groups:
             lr = group["lr"]
             for p in group["params"]:
@@ -402,21 +414,16 @@ def learning_rate_schedule(t: int, alph_max: float, alph_min: float, T_w: int, T
 
 
 def gradient_clip(params: Iterable[torch.nn.Parameter], M: float, eps=1e-6):
-    g_2 = 0
-    for param in params:
-        g = param.grad
-        if g is None:
-            continue
-        g_2 += (g * g).sum().item()
+    grads= [param.grad for param in params if param.grad is not None]
+    if not grads:
+        return
 
-    if sqrt(g_2) >= M:
-        for param in params:
-            if param.grad is None:
-                continue
-            param.grad *= M / (sqrt(g_2) + eps)
+    total_norm = torch.sqrt(torch.stack([g.pow(2).sum() for g in grads]).sum())
+    clip_coef = (M / (total_norm + eps)).clamp(max=1.0)
+    for g in grads:
+        g.mul_(clip_coef)
 
-
-def load_data(data: NDArray, batch_size: int, context_length: int, device: str):
+def load_data(data: NDArray, batch_size: int, context_length: int, device: torch.device | None):
     K = len(data)
     batches = []
     for _ in range(batch_size):
@@ -430,7 +437,7 @@ def load_data(data: NDArray, batch_size: int, context_length: int, device: str):
     ), torch.from_numpy(
         stack([batch[1] for batch in batches]),
     ).to(
-        device,
+        device=device,
         dtype=torch.int64,
     )
 
@@ -457,3 +464,119 @@ def load_checkpoint(
     model.load_state_dict(saved["model_state"])
     optimizer.load_state_dict(saved["optimizer_state"])
     return saved["iteration"]
+
+
+def training_together(
+    # Files
+    training_file: str | os.PathLike | typing.BinaryIO | typing.IO[bytes],
+    validation_file: str | os.PathLike | typing.BinaryIO | typing.IO[bytes],
+    # Data Params
+    context_length: int,
+    batch_size: int,
+    # Training steps
+    num_steps: int,
+    # Model and Optimizer
+    model: nn.Module,
+    optim: torch.optim.Optimizer,
+    # model_restart
+    start_iter=0,
+    checkpoint_every=100,
+    checkpoint_prefix="cool_model",
+    # Gradient Clip Threshold
+    M: float = 1,
+    # LR schedule
+    alph_max: float = 1e-3,
+    alph_min: float = 1e-4,
+    T_w: int = -1,
+    T_c: int = -1,
+    # Classic dtype
+    dtype: torch.dtype | None = None,
+    device: torch.device | None = None,
+):
+    if T_w < 0:
+        T_w = num_steps // 100
+    if T_c < 0:
+        T_c = num_steps
+    training_data = np.memmap(training_file, dtype=np.uint16, mode="r")
+    validation_data = np.memmap(validation_file, dtype=np.uint16, mode="r")
+
+    best = float("inf")
+    train_loss = [best]
+    val_loss = [best]
+
+    pbar = tqdm(range(start_iter, num_steps), total=num_steps, desc="Step")
+    for t in pbar:
+        pbar.set_postfix({"train": f"{train_loss[-1]:.4f}", "val": f"{val_loss[-1]:.4f}"})
+        # Load the batch
+        batch_in, expected = load_data(training_data, batch_size, context_length, device)
+        predict = model(batch_in)
+        loss = cross_entropy(predict, expected)
+
+        # Clear old grad
+        optim.zero_grad()
+        # Loss
+        loss.backward()
+
+        # Perform LR schedule and Gradient clip
+        lr = learning_rate_schedule(t, alph_max, alph_min, T_w, T_c)
+        for group in optim.param_groups:
+            group["lr"] = lr
+        gradient_clip(model.parameters(), M)
+        optim.step()
+
+        train_loss.append(loss.item())
+
+        if t % checkpoint_every == 0:
+            save_checkpoint(model, optim, t, f"{checkpoint_prefix}_crash.model.tmp")
+            os.rename(f"{checkpoint_prefix}_crash.model.tmp", f"{checkpoint_prefix}_crash.model")
+            with torch.no_grad():
+                valid_batch, expected = load_data(validation_data, batch_size, context_length, device)
+                val_predict = model(valid_batch)
+                valid_loss = cross_entropy(val_predict, expected)
+                val_loss.append(valid_loss.item())
+
+                if val_loss[-1] < best:
+                    best = val_loss[-1]
+                    save_checkpoint(model, optim, t, f"{checkpoint_prefix}_best.model.tmp")
+                    os.rename(f"{checkpoint_prefix}_best.model.tmp", f"{checkpoint_prefix}_best.model")
+
+    return train_loss, val_loss
+
+
+def decode(
+    model: nn.Module,
+    init_tokens: torch.Tensor,
+    temp: float = 1,
+    top_p: float = 1,
+    device: torch.device | None = None,
+):
+    """
+    We will assume that init_tokens is just (seq, )
+    """
+    predict = model(init_tokens)
+    # Prediction will be (seq, vocab) we care only about the last one
+    last = predict[-1]
+    return sample(last, temp, top_p)
+
+
+def sample(
+    logits: torch.Tensor,
+    temp,
+    top_p,
+):
+    probs = softmax(logits, temp=temp).to(device="cpu")
+    vocab = probs.shape[0]
+    if top_p < 1:
+        index = sorted([i for i in range(vocab)], key=lambda i: -probs[i].item())
+        curr = 0
+        curr_prob = 0
+        selected = []
+        while curr_prob <= top_p:
+            curr_prob += probs[index[curr]].item()
+            selected.append(index[curr])
+            curr += 1
+        # Clear remaining
+        probs[~torch.isin(torch.arange(vocab), torch.tensor(selected))] = 0
+        # renormalize
+        probs = probs / torch.sum(probs)
+    return torch.multinomial(probs, 1)[0].item()
